@@ -1,254 +1,492 @@
-import argparse
-import copy
-import json
+# =====================================================
+# HYBRID IDS PROJECT
+# Classical ML vs VQC vs QCNN
+# FIXED & REWRITTEN VERSION
+# =====================================================
+
 import os
-import sys
 import time
+import joblib
+import numpy as np
+import pandas as pd
+import pennylane as qml
+import pennylane.numpy as qnp
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-if sys.version_info >= (3, 14):
-    raise RuntimeError(
-        "This project should be run with Python 3.10-3.13 because PyTorch is "
-        "not installed for Python 3.14 here. Use `py -3.10 main.py`."
-    )
-
-import torch
-
-from deployment.convert_int8 import convert_int8
-from models.mpt_model import get_model
-from models.qat_model import apply_qat
-from utils.evaluate import evaluate_model
-from utils.preprocess import (
-    build_fold_loaders,
-    build_stratified_folds,
-    load_data,
-    load_unseen_data,
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler, label_binarize
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    roc_curve,
 )
-from utils.train import train_model
-
-OUTPUT_DIR = "outputs"
-SUMMARY_PATH = os.path.join(OUTPUT_DIR, "summary.json")
-TEXT_SUMMARY_PATH = os.path.join(OUTPUT_DIR, "summary.txt")
-EVALUATION_PATH = os.path.join(OUTPUT_DIR, "evaluation_details.json")
-KFOLD_PATH = os.path.join(OUTPUT_DIR, "kfold_summary.json")
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from xgboost import XGBClassifier
 
 
-def _print_summary(summary, cached=False):
-    if cached:
-        print("\nUsing cached results from previous run.")
-    print("\n=== PERFORMANCE COMPARISON ===")
-    print(f"FP32 Accuracy : {summary['fp32_acc']:.2f}%")
-    print(f"MPT Accuracy  : {summary['mpt_acc']:.2f}%")
-    print(f"QAT Accuracy  : {summary['qat_acc']:.2f}%")
-    if summary.get("unseen_mpt_acc") is not None:
-        print(f"Unseen MPT Accuracy : {summary['unseen_mpt_acc']:.2f}%")
-    print(f"\nFP32 Size : {summary['fp32_size_mb']:.2f} MB")
-    print(f"INT8 Size : {summary['int8_size_mb']:.2f} MB")
-    print(f"\nFP32 Time : {summary['fp32_time_s']:.2f}s")
-    print(f"MPT Time  : {summary['mpt_time_s']:.2f}s")
-    if summary.get("kfold_mean_acc") is not None:
-        print(f"K-Fold Mean Accuracy : {summary['kfold_mean_acc']:.2f}%")
+# =====================================================
+# SETTINGS
+# =====================================================
+
+N_QUBITS      = 10
+N_LAYERS      = 3
+EPOCHS        = 30
+BATCH_SIZE    = 32
+SAMPLE_SIZE   = 15000
+LEARNING_RATE = 0.05
+
+# VQC weight layout: N_LAYERS x N_QUBITS x 3 rotations = flat size
+VQC_N_WEIGHTS  = N_LAYERS * N_QUBITS * 3
+# QCNN weight layout: one RY per qubit in conv layer = flat size
+QCNN_N_WEIGHTS = N_QUBITS
+
+USE_SAVED_RESULTS = True # set True to skip training and load cached results
+
+os.makedirs("results", exist_ok=True)
+os.makedirs("models",  exist_ok=True)
 
 
-def _save_summary(summary):
-    with open(SUMMARY_PATH, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
+# =====================================================
+# DATA LOADING & PREPROCESSING
+# =====================================================
 
-    with open(TEXT_SUMMARY_PATH, "w", encoding="utf-8") as f:
-        f.write("Crop Disease MPT/QAT Summary\n")
-        f.write(f"FP32 Accuracy: {summary['fp32_acc']:.2f}%\n")
-        f.write(f"MPT Accuracy: {summary['mpt_acc']:.2f}%\n")
-        f.write(f"QAT Accuracy: {summary['qat_acc']:.2f}%\n")
-        if summary.get("unseen_mpt_acc") is not None:
-            f.write(f"Unseen MPT Accuracy: {summary['unseen_mpt_acc']:.2f}%\n")
-        f.write(f"FP32 Size: {summary['fp32_size_mb']:.2f} MB\n")
-        f.write(f"INT8 Size: {summary['int8_size_mb']:.2f} MB\n")
-        f.write(f"FP32 Time: {summary['fp32_time_s']:.2f}s\n")
-        f.write(f"MPT Time: {summary['mpt_time_s']:.2f}s\n")
-        if summary.get("kfold_mean_acc") is not None:
-            f.write(f"K-Fold Mean Accuracy: {summary['kfold_mean_acc']:.2f}%\n")
+print("=" * 60)
+print("Loading dataset...")
+print("=" * 60)
 
+df = pd.read_csv("data/iot_combined.csv")
 
-def _save_json(path, payload):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+POSSIBLE_LABELS = ["Label", "label", "Attack", "attack", "Category", "Class"]
+target_col = next((c for c in POSSIBLE_LABELS if c in df.columns), None)
 
+if target_col is None:
+    raise ValueError(f"Label column not found. Columns: {list(df.columns)}")
 
-def run_kfold_validation(data_dir, k_folds=5):
-    folds, samples, class_names = build_stratified_folds(data_dir, k_folds=k_folds)
-    fold_results = []
-    num_classes = len(class_names)
+print(f"Target column: {target_col}")
 
-    for fold_idx, val_indices in enumerate(folds, start=1):
-        print(f"\n=== K-FOLD {fold_idx}/{k_folds} ===")
-        train_loader, val_loader = build_fold_loaders(samples, val_indices)
-        fold_model = get_model(num_classes)
-        fold_model = train_model(fold_model, train_loader, epochs=1)
-        fold_metrics = evaluate_model(
-            fold_model,
-            val_loader,
-            class_names=class_names,
-            return_details=True,
-            title=f"KFold-{fold_idx}",
-        )
-        fold_results.append(
-            {
-                "fold": fold_idx,
-                "accuracy": fold_metrics["accuracy"],
-                "macro_f1": fold_metrics["macro_f1"],
-            }
-        )
+y_raw = df[target_col]
+X_raw = df.drop(columns=[target_col])
 
-    mean_acc = sum(item["accuracy"] for item in fold_results) / len(fold_results)
-    mean_f1 = sum(item["macro_f1"] for item in fold_results) / len(fold_results)
-    kfold_summary = {
-        "k_folds": k_folds,
-        "mean_accuracy": mean_acc,
-        "mean_macro_f1": mean_f1,
-        "folds": fold_results,
-    }
-    _save_json(KFOLD_PATH, kfold_summary)
-    return kfold_summary
+X_raw = X_raw.select_dtypes(include=[np.number])
+X_raw = X_raw.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+class_names = sorted(y_raw.unique().tolist())
+label_map   = {c: i for i, c in enumerate(class_names)}
+y_encoded   = y_raw.map(label_map)
+
+n_classes = len(class_names)
+print(f"Classes ({n_classes}): {class_names}")
+
+scaler   = MinMaxScaler()
+X_scaled = scaler.fit_transform(X_raw)
+X_scaled = X_scaled[:, :N_QUBITS]   # keep only N_QUBITS features
+
+X_sample, _, y_sample, _ = train_test_split(
+    X_scaled, y_encoded,
+    train_size=SAMPLE_SIZE,
+    stratify=y_encoded,
+    random_state=42,
+)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X_sample, y_sample,
+    test_size=0.2,
+    stratify=y_sample,
+    random_state=42,
+)
+
+X_train = np.array(X_train, dtype=np.float64)
+X_test  = np.array(X_test,  dtype=np.float64)
+y_train = np.array(y_train, dtype=np.int64)
+y_test  = np.array(y_test,  dtype=np.int64)
+
+y_test_bin = label_binarize(y_test, classes=list(range(n_classes)))
+
+print(f"Train size: {len(X_train)} | Test size: {len(X_test)}")
 
 
-def run_pipeline(force_run=False, unseen_dir="dataset_unseen", run_kfold=False, k_folds=5):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+# =====================================================
+# HELPERS
+# =====================================================
 
-    if os.path.exists(SUMMARY_PATH) and not force_run:
-        with open(SUMMARY_PATH, "r", encoding="utf-8") as f:
-            summary = json.load(f)
-        _print_summary(summary, cached=True)
-        print(f"\nSaved summary file: {TEXT_SUMMARY_PATH}")
-        return
+def softmax(x: np.ndarray) -> np.ndarray:
+    e = np.exp(x - np.max(x))
+    return e / e.sum()
 
-    print("\n=== STEP 1: DATA LOADING ===")
-    train_loader, test_loader, num_classes, class_names, class_to_idx = load_data("dataset")
-    print("Classes:", num_classes)
 
-    print("\n=== STEP 2: BASELINE (FP32) ===")
-    model = get_model(num_classes)
-    start = time.time()
-    model = train_model(model, train_loader)
-    fp32_time = time.time() - start
-    fp32_details = evaluate_model(
-        model,
-        test_loader,
-        class_names=class_names,
-        return_details=True,
-        title="FP32",
-    )
-    fp32_acc = fp32_details["accuracy"]
-    torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "model_fp32.pth"))
+def cross_entropy_loss(logits, y_batch):
+    """Numerically stable softmax cross-entropy for qnp arrays."""
+    shifted = logits - qnp.max(logits, axis=1, keepdims=True)
+    exp_l   = qnp.exp(shifted)
+    probs   = exp_l / qnp.sum(exp_l, axis=1, keepdims=True)
+    nll     = -qnp.log(probs[range(len(y_batch)), y_batch] + 1e-9)
+    return qnp.mean(nll)
 
-    print("\n=== STEP 3: MPT TRAINING ===")
-    start = time.time()
-    model = train_model(model, train_loader)
-    mpt_time = time.time() - start
-    mpt_details = evaluate_model(
-        model,
-        test_loader,
-        class_names=class_names,
-        return_details=True,
-        title="MPT",
-    )
-    mpt_acc = mpt_details["accuracy"]
-    torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "model_mpt.pth"))
-    mpt_model_for_unseen = copy.deepcopy(model).to("cpu").eval()
 
-    print("\n=== STEP 4: QAT ===")
-    fp32_fallback_model = copy.deepcopy(model)
-    model = apply_qat(model)
-    model = train_model(model, train_loader)
+# =====================================================
+# LOAD SAVED RESULTS (optional fast path)
+# =====================================================
 
-    print("\n=== STEP 5: INT8 CONVERSION ===")
-    model = convert_int8(model, fallback_model=fp32_fallback_model)
-    qat_details = evaluate_model(
-        model,
-        test_loader,
-        class_names=class_names,
-        return_details=True,
-        title="QAT/INT8",
-    )
-    qat_acc = qat_details["accuracy"]
-    torch.save(model, os.path.join(OUTPUT_DIR, "model_int8.pth"))
+if USE_SAVED_RESULTS and os.path.exists("results/final_results.pkl"):
+    print("\nLoading saved results...")
+    results         = joblib.load("results/final_results.pkl")
+    classical_preds = joblib.load("results/classical_preds.pkl")
+    classical_probs = joblib.load("results/classical_probs.pkl")
+    vqc_preds       = joblib.load("results/vqc_preds.pkl")
+    vqc_probs       = joblib.load("results/vqc_probs.pkl")
+    qcnn_preds      = joblib.load("results/qcnn_preds.pkl")
+    qcnn_probs      = joblib.load("results/qcnn_probs.pkl")
+    training_times  = joblib.load("results/training_times.pkl")
 
-    unseen_details = None
-    unseen_loader = load_unseen_data(unseen_dir, class_to_idx=class_to_idx)
-    if unseen_loader is not None:
-        print(f"\n=== STEP 6: UNSEEN DATASET EVALUATION ({unseen_dir}) ===")
-        unseen_details = evaluate_model(
-            mpt_model_for_unseen,
-            unseen_loader,
-            class_names=class_names,
-            return_details=True,
-            title="Unseen(MPT)",
-        )
-    else:
-        print(f"\nNo unseen dataset found at '{unseen_dir}'. Skipping domain-shift check.")
+else:
 
-    kfold_summary = None
-    if run_kfold:
-        print(f"\n=== STEP 7: {k_folds}-FOLD VALIDATION ===")
-        kfold_summary = run_kfold_validation("dataset", k_folds=k_folds)
+    results         = {}
+    classical_preds = {}
+    classical_probs = {}
+    training_times  = {}
 
-    fp32_size = os.path.getsize(os.path.join(OUTPUT_DIR, "model_fp32.pth")) / (1024 * 1024)
-    int8_size = os.path.getsize(os.path.join(OUTPUT_DIR, "model_int8.pth")) / (1024 * 1024)
+    # =================================================
+    # CLASSICAL ML
+    # =================================================
 
-    summary = {
-        "fp32_acc": fp32_acc,
-        "mpt_acc": mpt_acc,
-        "qat_acc": qat_acc,
-        "unseen_mpt_acc": unseen_details["accuracy"] if unseen_details else None,
-        "fp32_size_mb": fp32_size,
-        "int8_size_mb": int8_size,
-        "fp32_time_s": fp32_time,
-        "mpt_time_s": mpt_time,
-        "kfold_mean_acc": kfold_summary["mean_accuracy"] if kfold_summary else None,
+    print("\n" + "=" * 60)
+    print("Training Classical Models")
+    print("=" * 60)
+
+    classical_models = {
+        "Logistic Regression": LogisticRegression(max_iter=500),
+        "Decision Tree":       DecisionTreeClassifier(),
+        "Random Forest":       RandomForestClassifier(n_estimators=100),
+        "SVM":                 SVC(probability=True),
+        "XGBoost":             XGBClassifier(eval_metric="mlogloss", verbosity=0),
     }
 
-    evaluation_bundle = {
-        "class_names": class_names,
-        "fp32": fp32_details,
-        "mpt": mpt_details,
-        "qat_int8": qat_details,
-        "unseen_mpt": unseen_details,
-    }
+    for name, model in classical_models.items():
+        print(f"\n--- {name} ---")
+        t0 = time.time()
+        model.fit(X_train, y_train)
+        training_times[name] = time.time() - t0
 
-    _save_summary(summary)
-    _save_json(EVALUATION_PATH, evaluation_bundle)
-    _print_summary(summary, cached=False)
-    print(f"\nSaved summary file: {TEXT_SUMMARY_PATH}")
-    print(f"Saved evaluation details: {EVALUATION_PATH}")
-    if kfold_summary:
-        print(f"Saved K-Fold summary: {KFOLD_PATH}")
+        preds = model.predict(X_test)
+        probs = model.predict_proba(X_test)
+        acc   = accuracy_score(y_test, preds)
+
+        print(f"Accuracy : {acc:.4f}")
+        print(classification_report(y_test, preds,
+                                    target_names=class_names,
+                                    zero_division=0))
+
+        results[name]         = acc
+        classical_preds[name] = preds
+        classical_probs[name] = probs
+        joblib.dump(model, f"models/{name.replace(' ', '_')}.pkl")
+
+    # =================================================
+    # QUANTUM DEVICE
+    # =================================================
+
+    dev = qml.device("lightning.qubit", wires=N_QUBITS)
+
+    # =================================================
+    # VQC
+    #
+    # ROOT CAUSE of the previous crash:
+    #   PennyLane's autograd tracer wraps the weight array
+    #   in a box object. When the weights are 3-D, multi-index
+    #   access like weights[layer, i, 0] triggers __getitem__
+    #   on the box with a tuple index, which the tracer cannot
+    #   handle and raises "too many indices for array".
+    #
+    # FIX: store weights as a FLAT 1-D array and compute
+    #   a single integer index inside the circuit.
+    #   flat_index = layer * N_QUBITS * 3 + qubit * 3 + rot
+    # =================================================
+
+    print("\n" + "=" * 60)
+    print("Training VQC")
+    print("=" * 60)
+
+    @qml.qnode(dev, interface="autograd")
+    def vqc_circuit(x, weights):
+        """
+        weights : flat 1-D array, length = N_LAYERS * N_QUBITS * 3
+        index   : weights[layer * N_QUBITS * 3 + qubit * 3 + rot_id]
+        """
+        for layer in range(N_LAYERS):
+            base = layer * N_QUBITS * 3
+            # Data re-uploading every layer
+            for i in range(N_QUBITS):
+                qml.RY(x[i] * np.pi, wires=i)
+            # Trainable Rot gates – ONE flat index per parameter
+            for i in range(N_QUBITS):
+                idx = base + i * 3
+                qml.Rot(weights[idx],
+                        weights[idx + 1],
+                        weights[idx + 2],
+                        wires=i)
+            # Ring CNOT entanglement
+            for i in range(N_QUBITS):
+                qml.CNOT(wires=[i, (i + 1) % N_QUBITS])
+
+        return [qml.expval(qml.PauliZ(i)) for i in range(n_classes)]
+
+    def vqc_cost(weights, X_batch, y_batch):
+        logits = qnp.array([vqc_circuit(x, weights) for x in X_batch])
+        return cross_entropy_loss(logits, y_batch)
+
+    # Flat 1-D initialisation
+    vqc_weights = qnp.array(
+        np.random.uniform(0, 2 * np.pi, VQC_N_WEIGHTS),
+        requires_grad=True,
+    )
+
+    vqc_opt = qml.AdamOptimizer(LEARNING_RATE)
+    t0 = time.time()
+
+    for epoch in range(EPOCHS):
+        idx = np.random.permutation(len(X_train))
+        for start in range(0, len(X_train), BATCH_SIZE):
+            batch_idx = idx[start: start + BATCH_SIZE]
+            X_batch   = X_train[batch_idx]
+            y_batch   = y_train[batch_idx].tolist()   # plain list → no grad
+
+            # Lambda ensures only vqc_weights is differentiated
+            vqc_weights = vqc_opt.step(
+                lambda w: vqc_cost(w, X_batch, y_batch),
+                vqc_weights,
+            )
+            # Re-wrap to preserve requires_grad after optimizer step
+            vqc_weights = qnp.array(vqc_weights, requires_grad=True)
+
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"  VQC epoch {epoch + 1}/{EPOCHS}")
+
+    training_times["VQC"] = time.time() - t0
+
+    vqc_preds = []
+    vqc_probs = []
+    for x in X_test:
+        logits = np.array(vqc_circuit(x, vqc_weights))
+        prob   = softmax(logits)
+        vqc_probs.append(prob)
+        vqc_preds.append(int(np.argmax(prob)))
+
+    vqc_acc = accuracy_score(y_test, vqc_preds)
+    print(f"VQC Accuracy: {vqc_acc:.4f}")
+    print(classification_report(y_test, vqc_preds,
+                                 target_names=class_names,
+                                 zero_division=0))
+    results["VQC"] = vqc_acc
+
+    # =================================================
+    # QCNN – same flat-weight pattern for consistency
+    # =================================================
+
+    print("\n" + "=" * 60)
+    print("Training QCNN")
+    print("=" * 60)
+
+    @qml.qnode(dev, interface="autograd")
+    def qcnn_circuit(x, weights):
+        """
+        weights : flat 1-D array, length = N_QUBITS
+        Conv layer: stride-2 CNOT pairs, one RY per qubit.
+        """
+        for i in range(N_QUBITS):
+            qml.RY(x[i] * np.pi, wires=i)
+
+        for i in range(0, N_QUBITS - 1, 2):
+            qml.CNOT(wires=[i, i + 1])
+            qml.RY(weights[i],     wires=i)
+            qml.RY(weights[i + 1], wires=i + 1)
+
+        return [qml.expval(qml.PauliZ(i)) for i in range(n_classes)]
+
+    def qcnn_cost(weights, X_batch, y_batch):
+        logits = qnp.array([qcnn_circuit(x, weights) for x in X_batch])
+        return cross_entropy_loss(logits, y_batch)
+
+    qcnn_weights = qnp.array(
+        np.random.uniform(0, 2 * np.pi, QCNN_N_WEIGHTS),
+        requires_grad=True,
+    )
+
+    qcnn_opt = qml.AdamOptimizer(LEARNING_RATE)
+    t0 = time.time()
+
+    for epoch in range(EPOCHS):
+        idx = np.random.permutation(len(X_train))
+        for start in range(0, len(X_train), BATCH_SIZE):
+            batch_idx = idx[start: start + BATCH_SIZE]
+            X_batch   = X_train[batch_idx]
+            y_batch   = y_train[batch_idx].tolist()
+
+            qcnn_weights = qcnn_opt.step(
+                lambda w: qcnn_cost(w, X_batch, y_batch),
+                qcnn_weights,
+            )
+            qcnn_weights = qnp.array(qcnn_weights, requires_grad=True)
+
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"  QCNN epoch {epoch + 1}/{EPOCHS}")
+
+    training_times["QCNN"] = time.time() - t0
+
+    qcnn_preds = []
+    qcnn_probs = []
+    for x in X_test:
+        logits = np.array(qcnn_circuit(x, qcnn_weights))
+        prob   = softmax(logits)
+        qcnn_probs.append(prob)
+        qcnn_preds.append(int(np.argmax(prob)))
+
+    qcnn_acc = accuracy_score(y_test, qcnn_preds)
+    print(f"QCNN Accuracy: {qcnn_acc:.4f}")
+    print(classification_report(y_test, qcnn_preds,
+                                  target_names=class_names,
+                                  zero_division=0))
+    results["QCNN"] = qcnn_acc
+
+    # =================================================
+    # SAVE
+    # =================================================
+
+    joblib.dump(results,         "results/final_results.pkl")
+    joblib.dump(classical_preds, "results/classical_preds.pkl")
+    joblib.dump(classical_probs, "results/classical_probs.pkl")
+    joblib.dump(vqc_preds,       "results/vqc_preds.pkl")
+    joblib.dump(vqc_probs,       "results/vqc_probs.pkl")
+    joblib.dump(qcnn_preds,      "results/qcnn_preds.pkl")
+    joblib.dump(qcnn_probs,      "results/qcnn_probs.pkl")
+    joblib.dump(training_times,  "results/training_times.pkl")
+    print("\nAll results saved to results/")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--force-run",
-        action="store_true",
-        help="Run full training again and overwrite cached summary.",
-    )
-    parser.add_argument(
-        "--unseen-dir",
-        default="dataset_unseen",
-        help="Optional unseen dataset directory for domain-shift evaluation.",
-    )
-    parser.add_argument(
-        "--run-kfold",
-        action="store_true",
-        help="Run stratified K-fold validation after main training.",
-    )
-    parser.add_argument(
-        "--kfolds",
-        type=int,
-        default=5,
-        help="Number of folds for K-fold validation.",
-    )
-    args = parser.parse_args()
-    run_pipeline(
-        force_run=args.force_run,
-        unseen_dir=args.unseen_dir,
-        run_kfold=args.run_kfold,
-        k_folds=args.kfolds,
-    )
+# =====================================================
+# HELPER ACCESSORS
+# =====================================================
+
+def get_preds(name):
+    if name in classical_preds:
+        return classical_preds[name]
+    return vqc_preds if name == "VQC" else qcnn_preds
+
+
+def get_probs(name):
+    if name in classical_probs:
+        return classical_probs[name]
+    return vqc_probs if name == "VQC" else qcnn_probs
+
+
+# =====================================================
+# PLOTS
+# =====================================================
+
+print("\n" + "=" * 60)
+print("Generating plots...")
+print("=" * 60)
+
+COLORS = plt.cm.tab10.colors
+
+# 1. Accuracy bar chart
+fig, ax = plt.subplots(figsize=(10, 5))
+names = list(results.keys())
+accs  = [results[n] for n in names]
+bars  = ax.bar(names, accs, color=COLORS[:len(names)], edgecolor="black")
+for bar, acc in zip(bars, accs):
+    ax.text(bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.005,
+            f"{acc:.3f}",
+            ha="center", va="bottom", fontsize=9, fontweight="bold")
+ax.set_ylim(0, 1.05)
+ax.set_ylabel("Accuracy")
+ax.set_title("Model Accuracy Comparison", fontsize=13, fontweight="bold")
+ax.tick_params(axis="x", rotation=30)
+plt.tight_layout()
+plt.savefig("results/accuracy.png", dpi=150)
+plt.close()
+print("  Saved: results/accuracy.png")
+
+# 2. Confusion matrices
+for name in results:
+    preds = get_preds(name)
+    cm    = confusion_matrix(y_test, preds)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
+    plt.colorbar(im, ax=ax)
+    tick_marks = np.arange(n_classes)
+    ax.set_xticks(tick_marks)
+    ax.set_yticks(tick_marks)
+    ax.set_xticklabels(class_names, rotation=45, ha="right", fontsize=8)
+    ax.set_yticklabels(class_names, fontsize=8)
+    thresh = cm.max() / 2.0
+    for i in range(n_classes):
+        for j in range(n_classes):
+            ax.text(j, i, str(cm[i, j]),
+                    ha="center", va="center", fontsize=7,
+                    color="white" if cm[i, j] > thresh else "black")
+    ax.set_xlabel("Predicted Label")
+    ax.set_ylabel("True Label")
+    ax.set_title(f"Confusion Matrix — {name}", fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    fname = f"results/confusion_{name.replace(' ', '_')}.png"
+    plt.savefig(fname, dpi=150)
+    plt.close()
+    print(f"  Saved: {fname}")
+
+# 3. ROC curves
+for name in results:
+    probs = np.array(get_probs(name))
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for i, cls in enumerate(class_names):
+        fpr, tpr, _ = roc_curve(y_test_bin[:, i], probs[:, i])
+        ax.plot(fpr, tpr, label=cls, linewidth=1.5)
+    ax.plot([0, 1], [0, 1], "k--", linewidth=0.8)
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title(f"ROC Curves — {name}", fontsize=12, fontweight="bold")
+    ax.legend(fontsize=7, loc="lower right")
+    plt.tight_layout()
+    fname = f"results/roc_{name.replace(' ', '_')}.png"
+    plt.savefig(fname, dpi=150)
+    plt.close()
+    print(f"  Saved: {fname}")
+
+# 4. Training time bar chart
+fig, ax = plt.subplots(figsize=(10, 5))
+t_names = list(training_times.keys())
+t_vals  = [training_times[n] for n in t_names]
+bars    = ax.bar(t_names, t_vals, color=COLORS[:len(t_names)], edgecolor="black")
+for bar, t in zip(bars, t_vals):
+    ax.text(bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.5,
+            f"{t:.1f}s",
+            ha="center", va="bottom", fontsize=9, fontweight="bold")
+ax.set_ylabel("Time (seconds)")
+ax.set_title("Training Time Comparison", fontsize=13, fontweight="bold")
+ax.tick_params(axis="x", rotation=30)
+plt.tight_layout()
+plt.savefig("results/training_time.png", dpi=150)
+plt.close()
+print("  Saved: results/training_time.png")
+
+
+# =====================================================
+# FINAL SUMMARY
+# =====================================================
+
+print("\n" + "=" * 60)
+print("FINAL ACCURACY SUMMARY")
+print("=" * 60)
+for model_name, acc in sorted(results.items(), key=lambda x: -x[1]):
+    bar   = "█" * int(acc * 40)
+    ttime = training_times.get(model_name, 0)
+    print(f"  {model_name:<22} {acc:.4f}  {bar}  ({ttime:.1f}s)")
+
+print("\nAll outputs saved in the results/ folder.")
